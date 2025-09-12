@@ -1,0 +1,634 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/utils/Counters.sol";
+
+/**
+ * @title DataCollectionStrategy
+ * @dev Comprehensive data collection contract with multiple collection methods,
+ * validation, access control, and efficient storage
+ */
+contract DataCollectionStrategy is AccessControl, ReentrancyGuard, Pausable {
+    using Counters for Counters.Counter;
+    
+    // Role definitions
+    bytes32 public constant DATA_PROVIDER_ROLE = keccak256("DATA_PROVIDER_ROLE");
+    bytes32 public constant DATA_VALIDATOR_ROLE = keccak256("DATA_VALIDATOR_ROLE");
+    bytes32 public constant DATA_CONSUMER_ROLE = keccak256("DATA_CONSUMER_ROLE");
+    bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
+    
+    // Counters for tracking
+    Counters.Counter private _dataEntryCounter;
+    Counters.Counter private _batchCounter;
+    
+    // Data structures
+    struct DataEntry {
+        uint256 id;
+        address provider;
+        bytes32 dataHash;
+        string metadataURI;
+        uint256 timestamp;
+        DataType dataType;
+        ValidationStatus status;
+        uint256 validationCount;
+        mapping(address => bool) validators;
+    }
+    
+    struct BatchData {
+        uint256 batchId;
+        uint256[] dataIds;
+        address submitter;
+        uint256 timestamp;
+        bool processed;
+    }
+    
+    struct DataSource {
+        address sourceAddress;
+        string name;
+        bool active;
+        uint256 reputation;
+        uint256 totalSubmissions;
+        uint256 validSubmissions;
+    }
+    
+    struct ValidationRule {
+        string ruleName;
+        bytes32 ruleHash;
+        bool active;
+        uint256 minValidators;
+        uint256 consensusThreshold; // percentage (e.g., 75 for 75%)
+    }
+    
+    // Enums
+    enum DataType { 
+        SENSOR, 
+        USER_INPUT, 
+        ORACLE, 
+        COMPUTED, 
+        EXTERNAL_API,
+        IOT_DEVICE,
+        SURVEY_RESPONSE
+    }
+    
+    enum ValidationStatus { 
+        PENDING, 
+        VALIDATED, 
+        REJECTED, 
+        DISPUTED 
+    }
+    
+    enum CollectionMethod {
+        PUSH,      // Data providers push data
+        PULL,      // Contract pulls from external sources
+        ORACLE,    // Oracle-based collection
+        BATCH,     // Batch processing
+        STREAM     // Real-time streaming
+    }
+    
+    // Storage mappings
+    mapping(uint256 => DataEntry) public dataEntries;
+    mapping(uint256 => BatchData) public batchData;
+    mapping(address => DataSource) public dataSources;
+    mapping(bytes32 => ValidationRule) public validationRules;
+    mapping(address => uint256[]) public providerDataIds;
+    mapping(bytes32 => uint256[]) public dataByCategory;
+    mapping(address => mapping(uint256 => bool)) public accessPermissions;
+    
+    // Configuration variables
+    uint256 public minValidationRequired = 2;
+    uint256 public consensusThreshold = 75; // 75%
+    uint256 public reputationDecayRate = 1; // 1% per period
+    uint256 public maxBatchSize = 100;
+    uint256 public dataRetentionPeriod = 365 days;
+    
+    // Events
+    event DataSubmitted(
+        uint256 indexed dataId,
+        address indexed provider,
+        DataType dataType,
+        bytes32 dataHash
+    );
+    
+    event DataValidated(
+        uint256 indexed dataId,
+        address indexed validator,
+        ValidationStatus status
+    );
+    
+    event BatchProcessed(
+        uint256 indexed batchId,
+        uint256 dataCount,
+        address indexed submitter
+    );
+    
+    event DataSourceRegistered(
+        address indexed source,
+        string name
+    );
+    
+    event ValidationRuleUpdated(
+        bytes32 indexed ruleHash,
+        string ruleName,
+        bool active
+    );
+    
+    event DataAccessed(
+        uint256 indexed dataId,
+        address indexed accessor,
+        uint256 timestamp
+    );
+    
+    event ReputationUpdated(
+        address indexed provider,
+        uint256 oldReputation,
+        uint256 newReputation
+    );
+    
+    // Modifiers
+    modifier validDataId(uint256 _dataId) {
+        require(_dataId > 0 && _dataId <= _dataEntryCounter.current(), "Invalid data ID");
+        _;
+    }
+    
+    modifier onlyValidatedSource(address _source) {
+        require(dataSources[_source].active, "Source not active");
+        _;
+    }
+    
+    modifier withinRetentionPeriod(uint256 _dataId) {
+        require(
+            block.timestamp <= dataEntries[_dataId].timestamp + dataRetentionPeriod,
+            "Data beyond retention period"
+        );
+        _;
+    }
+    
+    constructor(address _admin) {
+        _grantRole(DEFAULT_ADMIN_ROLE, _admin);
+        _grantRole(DATA_VALIDATOR_ROLE, _admin);
+    }
+    
+    // === DATA SUBMISSION FUNCTIONS ===
+    
+    /**
+     * @dev Submit individual data entry
+     */
+    function submitData(
+        bytes32 _dataHash,
+        string memory _metadataURI,
+        DataType _dataType,
+        bytes32 _category
+    ) external onlyRole(DATA_PROVIDER_ROLE) whenNotPaused nonReentrant {
+        _dataEntryCounter.increment();
+        uint256 dataId = _dataEntryCounter.current();
+        
+        DataEntry storage entry = dataEntries[dataId];
+        entry.id = dataId;
+        entry.provider = msg.sender;
+        entry.dataHash = _dataHash;
+        entry.metadataURI = _metadataURI;
+        entry.timestamp = block.timestamp;
+        entry.dataType = _dataType;
+        entry.status = ValidationStatus.PENDING;
+        
+        // Update provider tracking
+        providerDataIds[msg.sender].push(dataId);
+        dataByCategory[_category].push(dataId);
+        
+        // Update source statistics
+        dataSources[msg.sender].totalSubmissions++;
+        
+        emit DataSubmitted(dataId, msg.sender, _dataType, _dataHash);
+    }
+    
+    /**
+     * @dev Submit batch data
+     */
+    function submitBatchData(
+        bytes32[] memory _dataHashes,
+        string[] memory _metadataURIs,
+        DataType[] memory _dataTypes,
+        bytes32 _category
+    ) external onlyRole(DATA_PROVIDER_ROLE) whenNotPaused nonReentrant {
+        require(_dataHashes.length <= maxBatchSize, "Batch too large");
+        require(
+            _dataHashes.length == _metadataURIs.length &&
+            _dataHashes.length == _dataTypes.length,
+            "Array length mismatch"
+        );
+        
+        _batchCounter.increment();
+        uint256 batchId = _batchCounter.current();
+        
+        BatchData storage batch = batchData[batchId];
+        batch.batchId = batchId;
+        batch.submitter = msg.sender;
+        batch.timestamp = block.timestamp;
+        
+        for (uint256 i = 0; i < _dataHashes.length; i++) {
+            _dataEntryCounter.increment();
+            uint256 dataId = _dataEntryCounter.current();
+            
+            DataEntry storage entry = dataEntries[dataId];
+            entry.id = dataId;
+            entry.provider = msg.sender;
+            entry.dataHash = _dataHashes[i];
+            entry.metadataURI = _metadataURIs[i];
+            entry.timestamp = block.timestamp;
+            entry.dataType = _dataTypes[i];
+            entry.status = ValidationStatus.PENDING;
+            
+            batch.dataIds.push(dataId);
+            providerDataIds[msg.sender].push(dataId);
+            dataByCategory[_category].push(dataId);
+            
+            emit DataSubmitted(dataId, msg.sender, _dataTypes[i], _dataHashes[i]);
+        }
+        
+        dataSources[msg.sender].totalSubmissions += _dataHashes.length;
+        
+        emit BatchProcessed(batchId, _dataHashes.length, msg.sender);
+    }
+    
+    // === VALIDATION FUNCTIONS ===
+    
+    /**
+     * @dev Validate data entry
+     */
+    function validateData(
+        uint256 _dataId,
+        bool _isValid
+    ) external onlyRole(DATA_VALIDATOR_ROLE) validDataId(_dataId) nonReentrant {
+        DataEntry storage entry = dataEntries[_dataId];
+        require(entry.status == ValidationStatus.PENDING, "Data already processed");
+        require(!entry.validators[msg.sender], "Already validated by this validator");
+        
+        entry.validators[msg.sender] = true;
+        entry.validationCount++;
+        
+        if (entry.validationCount >= minValidationRequired) {
+            // Calculate consensus
+            uint256 validCount = _countValidValidations(_dataId);
+            uint256 consensusPercent = (validCount * 100) / entry.validationCount;
+            
+            if (consensusPercent >= consensusThreshold) {
+                entry.status = ValidationStatus.VALIDATED;
+                _updateProviderReputation(entry.provider, true);
+                dataSources[entry.provider].validSubmissions++;
+            } else {
+                entry.status = ValidationStatus.REJECTED;
+                _updateProviderReputation(entry.provider, false);
+            }
+        }
+        
+        emit DataValidated(_dataId, msg.sender, entry.status);
+    }
+    
+    /**
+     * @dev Batch validate multiple data entries
+     */
+    function batchValidateData(
+        uint256[] memory _dataIds,
+        bool[] memory _validationResults
+    ) external onlyRole(DATA_VALIDATOR_ROLE) nonReentrant {
+        require(_dataIds.length == _validationResults.length, "Array length mismatch");
+        require(_dataIds.length <= 50, "Batch too large");
+        
+        for (uint256 i = 0; i < _dataIds.length; i++) {
+            if (_dataIds[i] > 0 && _dataIds[i] <= _dataEntryCounter.current()) {
+                DataEntry storage entry = dataEntries[_dataIds[i]];
+                if (entry.status == ValidationStatus.PENDING && !entry.validators[msg.sender]) {
+                    entry.validators[msg.sender] = true;
+                    entry.validationCount++;
+                    
+                    emit DataValidated(_dataIds[i], msg.sender, entry.status);
+                }
+            }
+        }
+    }
+    
+    // === DATA ACCESS FUNCTIONS ===
+    
+    /**
+     * @dev Get data entry details
+     */
+    function getDataEntry(uint256 _dataId) 
+        external 
+        view 
+        validDataId(_dataId) 
+        withinRetentionPeriod(_dataId)
+        returns (
+            address provider,
+            bytes32 dataHash,
+            string memory metadataURI,
+            uint256 timestamp,
+            DataType dataType,
+            ValidationStatus status
+        ) 
+    {
+        require(
+            hasRole(DATA_CONSUMER_ROLE, msg.sender) || 
+            accessPermissions[msg.sender][_dataId],
+            "No access permission"
+        );
+        
+        DataEntry storage entry = dataEntries[_dataId];
+        return (
+            entry.provider,
+            entry.dataHash,
+            entry.metadataURI,
+            entry.timestamp,
+            entry.dataType,
+            entry.status
+        );
+    }
+    
+    /**
+     * @dev Get data by category
+     */
+    function getDataByCategory(bytes32 _category) 
+        external 
+        view 
+        onlyRole(DATA_CONSUMER_ROLE)
+        returns (uint256[] memory) 
+    {
+        return dataByCategory[_category];
+    }
+    
+    /**
+     * @dev Get provider's data entries
+     */
+    function getProviderData(address _provider) 
+        external 
+        view 
+        returns (uint256[] memory) 
+    {
+        require(
+            msg.sender == _provider || 
+            hasRole(DATA_CONSUMER_ROLE, msg.sender),
+            "No access permission"
+        );
+        
+        return providerDataIds[_provider];
+    }
+    
+    // === ORACLE INTEGRATION ===
+    
+    /**
+     * @dev Oracle data submission
+     */
+    function oracleSubmitData(
+        bytes32 _dataHash,
+        string memory _metadataURI,
+        bytes32 _category,
+        bytes memory _signature
+    ) external onlyRole(ORACLE_ROLE) whenNotPaused nonReentrant {
+        // Verify oracle signature
+        bytes32 messageHash = keccak256(abi.encodePacked(_dataHash, _metadataURI, _category));
+        require(_verifyOracleSignature(messageHash, _signature), "Invalid oracle signature");
+        
+        _dataEntryCounter.increment();
+        uint256 dataId = _dataEntryCounter.current();
+        
+        DataEntry storage entry = dataEntries[dataId];
+        entry.id = dataId;
+        entry.provider = msg.sender;
+        entry.dataHash = _dataHash;
+        entry.metadataURI = _metadataURI;
+        entry.timestamp = block.timestamp;
+        entry.dataType = DataType.ORACLE;
+        entry.status = ValidationStatus.VALIDATED; // Oracle data is pre-validated
+        
+        dataByCategory[_category].push(dataId);
+        providerDataIds[msg.sender].push(dataId);
+        dataSources[msg.sender].totalSubmissions++;
+        dataSources[msg.sender].validSubmissions++;
+        
+        emit DataSubmitted(dataId, msg.sender, DataType.ORACLE, _dataHash);
+    }
+    
+    // === DATA SOURCE MANAGEMENT ===
+    
+    /**
+     * @dev Register new data source
+     */
+    function registerDataSource(
+        address _source,
+        string memory _name
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_source != address(0), "Invalid source address");
+        
+        DataSource storage source = dataSources[_source];
+        source.sourceAddress = _source;
+        source.name = _name;
+        source.active = true;
+        source.reputation = 100; // Starting reputation
+        
+        _grantRole(DATA_PROVIDER_ROLE, _source);
+        
+        emit DataSourceRegistered(_source, _name);
+    }
+    
+    /**
+     * @dev Update data source status
+     */
+    function updateDataSourceStatus(
+        address _source,
+        bool _active
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        dataSources[_source].active = _active;
+    }
+    
+    // === VALIDATION RULE MANAGEMENT ===
+    
+    /**
+     * @dev Add validation rule
+     */
+    function addValidationRule(
+        string memory _ruleName,
+        bytes32 _ruleHash,
+        uint256 _minValidators,
+        uint256 _consensusThreshold
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        ValidationRule storage rule = validationRules[_ruleHash];
+        rule.ruleName = _ruleName;
+        rule.ruleHash = _ruleHash;
+        rule.active = true;
+        rule.minValidators = _minValidators;
+        rule.consensusThreshold = _consensusThreshold;
+        
+        emit ValidationRuleUpdated(_ruleHash, _ruleName, true);
+    }
+    
+    // === ACCESS CONTROL FUNCTIONS ===
+    
+    /**
+     * @dev Grant data access permission
+     */
+    function grantDataAccess(
+        address _user,
+        uint256 _dataId
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) validDataId(_dataId) {
+        accessPermissions[_user][_dataId] = true;
+    }
+    
+    /**
+     * @dev Revoke data access permission
+     */
+    function revokeDataAccess(
+        address _user,
+        uint256 _dataId
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) validDataId(_dataId) {
+        accessPermissions[_user][_dataId] = false;
+    }
+    
+    // === UTILITY FUNCTIONS ===
+    
+    /**
+     * @dev Get total data entries count
+     */
+    function getTotalDataEntries() external view returns (uint256) {
+        return _dataEntryCounter.current();
+    }
+    
+    /**
+     * @dev Get data source reputation
+     */
+    function getSourceReputation(address _source) external view returns (uint256) {
+        return dataSources[_source].reputation;
+    }
+    
+    /**
+     * @dev Get data source statistics
+     */
+    function getSourceStats(address _source) 
+        external 
+        view 
+        returns (
+            uint256 totalSubmissions,
+            uint256 validSubmissions,
+            uint256 reputation,
+            bool active
+        ) 
+    {
+        DataSource storage source = dataSources[_source];
+        return (
+            source.totalSubmissions,
+            source.validSubmissions,
+            source.reputation,
+            source.active
+        );
+    }
+    
+    // === ADMIN FUNCTIONS ===
+    
+    /**
+     * @dev Update configuration parameters
+     */
+    function updateConfig(
+        uint256 _minValidation,
+        uint256 _consensusThreshold,
+        uint256 _maxBatchSize,
+        uint256 _retentionPeriod
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        minValidationRequired = _minValidation;
+        consensusThreshold = _consensusThreshold;
+        maxBatchSize = _maxBatchSize;
+        dataRetentionPeriod = _retentionPeriod;
+    }
+    
+    /**
+     * @dev Emergency pause
+     */
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
+    }
+    
+    /**
+     * @dev Unpause
+     */
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
+    }
+    
+    /**
+     * @dev Cleanup old data beyond retention period
+     */
+    function cleanupOldData(uint256[] memory _dataIds) 
+        external 
+        onlyRole(DEFAULT_ADMIN_ROLE) 
+    {
+        for (uint256 i = 0; i < _dataIds.length; i++) {
+            if (block.timestamp > dataEntries[_dataIds[i]].timestamp + dataRetentionPeriod) {
+                delete dataEntries[_dataIds[i]];
+            }
+        }
+    }
+    
+    // === INTERNAL FUNCTIONS ===
+    
+    /**
+     * @dev Count valid validations for consensus
+     */
+    function _countValidValidations(uint256 _dataId) private view returns (uint256) {
+        // This would need to be implemented based on your validation logic
+        // For now, returning a placeholder
+        return dataEntries[_dataId].validationCount / 2; // Simplified logic
+    }
+    
+    /**
+     * @dev Update provider reputation
+     */
+    function _updateProviderReputation(address _provider, bool _validSubmission) private {
+        DataSource storage source = dataSources[_provider];
+        uint256 oldReputation = source.reputation;
+        
+        if (_validSubmission) {
+            source.reputation = oldReputation + (oldReputation < 100 ? 1 : 0);
+        } else {
+            source.reputation = oldReputation > 10 ? oldReputation - 5 : 5;
+        }
+        
+        emit ReputationUpdated(_provider, oldReputation, source.reputation);
+    }
+    
+    /**
+     * @dev Verify oracle signature
+     */
+    function _verifyOracleSignature(
+        bytes32 _messageHash,
+        bytes memory _signature
+    ) private view returns (bool) {
+        // Implement signature verification logic
+        // This is a placeholder implementation
+        return _signature.length == 65;
+    }
+    
+    // === EMERGENCY FUNCTIONS ===
+    
+    /**
+     * @dev Emergency data removal (admin only)
+     */
+    function emergencyRemoveData(uint256 _dataId) 
+        external 
+        onlyRole(DEFAULT_ADMIN_ROLE) 
+        validDataId(_dataId) 
+    {
+        delete dataEntries[_dataId];
+    }
+    
+    /**
+     * @dev Dispute data entry
+     */
+    function disputeData(uint256 _dataId) 
+        external 
+        onlyRole(DATA_VALIDATOR_ROLE) 
+        validDataId(_dataId) 
+    {
+        dataEntries[_dataId].status = ValidationStatus.DISPUTED;
+        emit DataValidated(_dataId, msg.sender, ValidationStatus.DISPUTED);
+    }
+}
